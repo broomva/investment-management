@@ -1,0 +1,223 @@
+version: 1
+profile: governed
+
+categories:
+  - id: trading_safety
+    name: Trading Safety & Execution Controls
+    setpoints: [S1, S2, S3, S4]
+  - id: risk_management
+    name: Risk Management & Drawdown Limits
+    setpoints: [S5, S6, S7]
+  - id: rebalancing
+    name: Rebalancing & Drift Controls
+    setpoints: [S8, S9]
+  - id: tax_optimization
+    name: Tax-Loss Harvesting & Compliance
+    setpoints: [S10, S11]
+  - id: data_integrity
+    name: Data & API Governance
+    setpoints: [S12, S13]
+  - id: agent_improvement
+    name: Agent Self-Improvement
+    setpoints: [S14, S15]
+
+setpoints:
+  # ── Trading Safety ──────────────────────────────────────────────
+  - id: S1
+    category: trading_safety
+    description: "Paper trading is the default — order.live must be false unless user provides explicit written confirmation"
+    target: 1.0
+    measurement: "paper_only_orders / total_orders (must be 1.0 unless live confirmation captured)"
+    severity: blocking
+    enforcement: |
+      Before any order with live=true is submitted:
+        1. Agent MUST display full order details (ticker, side, qty, price, estimated cost).
+        2. Agent MUST request explicit textual confirmation (e.g., "CONFIRM LIVE TRADE").
+        3. Confirmation must appear in the same session; stale confirmations are invalid.
+      Absent confirmation, override live=true to live=false and execute as paper trade.
+
+  - id: S2
+    category: trading_safety
+    description: "No single position may exceed 25% of total portfolio NAV at time of trade"
+    target: 0.25
+    measurement: "max(position_value / portfolio_nav)"
+    severity: blocking
+    enforcement: |
+      Before executing any buy order, compute:
+        new_position_value = (current_holding_qty + order_qty) * current_price
+        position_pct = new_position_value / portfolio_nav
+      If position_pct > 0.25, REJECT the order and suggest a reduced quantity
+      that would bring the position to exactly 25%.
+
+  - id: S3
+    category: trading_safety
+    description: "All limit orders must include a price within 5% of last trade price"
+    target: 1.0
+    measurement: "valid_limit_orders / total_limit_orders"
+    severity: informational
+    enforcement: |
+      Warn if limit_price deviates more than 5% from last close.
+      Log but do not block — user may have a valid reason (gap fills, momentum entries).
+
+  - id: S4
+    category: trading_safety
+    description: "Maximum 50 orders per trading session to prevent runaway loops"
+    target: 50
+    measurement: "orders_submitted_in_session"
+    severity: blocking
+    enforcement: |
+      If session order count reaches 50, halt all further order submission.
+      Agent must log a warning and require explicit user reset to continue.
+
+  # ── Risk Management ─────────────────────────────────────────────
+  - id: S5
+    category: risk_management
+    description: "Daily realized + unrealized loss must not exceed $5,000,000 COP (~$1,500 USD)"
+    target: -5000000  # COP
+    measurement: "daily_pnl_cop"
+    severity: blocking
+    enforcement: |
+      Track cumulative daily P&L in COP (convert USD positions via TRM rate).
+      If daily_pnl drops below -5,000,000 COP:
+        1. HALT all new buy orders immediately.
+        2. Allow only sell/close orders.
+        3. Log emergency stop event.
+        4. Notify user: "Daily loss limit reached. Only liquidation orders permitted."
+      Reset at market open next trading day.
+
+  - id: S6
+    category: risk_management
+    description: "Emergency stop — halt ALL trading if portfolio drawdown exceeds 15% from peak NAV"
+    target: -0.15
+    measurement: "(current_nav - peak_nav) / peak_nav"
+    severity: blocking
+    enforcement: |
+      Maintain a rolling peak NAV (high-water mark).
+      If drawdown exceeds 15%:
+        1. IMMEDIATELY halt all order submission (buy AND sell).
+        2. Log emergency stop with timestamp, peak NAV, current NAV, drawdown %.
+        3. Require explicit user command "RESUME TRADING" plus acknowledgment of drawdown.
+        4. On resume, reset peak NAV to current NAV.
+      This gate cannot be bypassed by any other rule.
+
+  - id: S7
+    category: risk_management
+    description: "Portfolio must maintain minimum 10% cash/equivalents buffer"
+    target: 0.10
+    measurement: "cash_and_equivalents / portfolio_nav"
+    severity: informational
+    enforcement: |
+      Before executing buy orders, verify post-trade cash >= 10% of NAV.
+      If cash would drop below 10%, warn user but do not block.
+      Log for rebalancing consideration.
+
+  # ── Rebalancing ─────────────────────────────────────────────────
+  - id: S8
+    category: rebalancing
+    description: "Trigger rebalance alert when any position drifts more than 5% from target weight"
+    target: 0.05
+    measurement: "max(abs(actual_weight - target_weight))"
+    severity: informational
+    enforcement: |
+      On every track mode invocation, compute drift per position.
+      If any position drift exceeds 5%:
+        1. Flag positions exceeding threshold.
+        2. Suggest rebalance trades with estimated quantities.
+        3. Indicate tax-loss harvesting opportunities if tax_aware=true.
+      Do NOT auto-execute rebalance — always require user confirmation.
+
+  - id: S9
+    category: rebalancing
+    description: "Rebalance execution must respect position size limits (S2) and daily loss limits (S5)"
+    target: 1.0
+    measurement: "compliant_rebalance_orders / total_rebalance_orders"
+    severity: blocking
+    enforcement: |
+      Every rebalance order is subject to all trading safety gates (S1-S4)
+      and risk management gates (S5-S7). No exception for rebalance orders.
+
+  # ── Tax Optimization ────────────────────────────────────────────
+  - id: S10
+    category: tax_optimization
+    description: "Tax-loss harvesting: identify positions with unrealized losses exceeding 5% held > 30 days"
+    target: 1.0
+    measurement: "tlh_candidates_flagged / tlh_candidates_eligible"
+    severity: informational
+    enforcement: |
+      On track/rebalance invocations with tax_aware=true:
+        1. Identify positions with unrealized loss > 5% AND holding period > 30 days.
+        2. Check wash-sale rule: no purchase of substantially identical security within 30 days.
+        3. Estimate tax savings in COP (apply Colombian capital gains rate or US rate as applicable).
+        4. Present candidates ranked by tax savings potential.
+      Colombian context: retención en la fuente on securities gains is typically 10% for >2yr holdings.
+
+  - id: S11
+    category: tax_optimization
+    description: "Track holding periods for Colombian tax brackets (< 2 years vs >= 2 years)"
+    target: 1.0
+    measurement: "positions_with_holding_period_tracked / total_positions"
+    severity: informational
+    enforcement: |
+      Every position must have acquisition_date recorded.
+      On sell order, compute holding period and warn if selling within 30 days
+      of crossing the 2-year threshold (where tax rate drops significantly).
+      Integrate with finance-substrate skill for unified tax projection.
+
+  # ── Data & API Governance ───────────────────────────────────────
+  - id: S12
+    category: data_integrity
+    description: "API rate limits respected — max 5 requests/second to any single data source"
+    target: 5
+    measurement: "max_requests_per_second_per_source"
+    severity: blocking
+    enforcement: |
+      Implement per-source rate limiters:
+        - Yahoo Finance: max 5 req/s, 2000 req/day
+        - BVC: max 2 req/s (conservative — no published limit)
+        - Superfinanciera: max 1 req/s
+        - Banrep: max 2 req/s
+        - SEC EDGAR: max 10 req/s (published fair-use policy)
+      On rate limit hit, back off exponentially (1s, 2s, 4s, max 60s).
+      Never retry more than 5 times.
+
+  - id: S13
+    category: data_integrity
+    description: "Market data must be < 24 hours old for any trade decision; stale data triggers warning"
+    target: 86400  # seconds
+    measurement: "max_data_age_seconds at time of trade decision"
+    severity: informational
+    enforcement: |
+      Before trade/optimize/risk calculations, check last refresh timestamp.
+      If data is older than 24 hours:
+        1. Warn: "Market data is [X] hours old. Refresh recommended."
+        2. For trade mode: block execution and require explicit data refresh or user override.
+      Weekend/holiday data is exempt (markets closed).
+
+  # ── Agent Self-Improvement ──────────────────────────────────────
+  - id: S14
+    category: agent_improvement
+    description: "Every trade (paper or live) produces a structured trace log"
+    target: 1.0
+    measurement: "trades_with_trace / total_trades"
+    severity: blocking
+    enforcement: |
+      Each trade must log to .control/trade-log.jsonl:
+        - timestamp, mode (paper/live), ticker, side, qty, price
+        - rationale (strategy reference or user instruction)
+        - pre-trade portfolio state snapshot
+        - post-trade portfolio state snapshot
+        - gates checked and results
+
+  - id: S15
+    category: agent_improvement
+    description: "Backtest results feed back into strategy parameter tuning suggestions"
+    target: 1.0
+    measurement: "backtests_with_improvement_signal / total_backtests"
+    severity: informational
+    enforcement: |
+      After each backtest run, log to .control/improvement-log.jsonl:
+        - strategy name, parameters used
+        - key metrics: sharpe, max_drawdown, total_return, win_rate
+        - comparison to benchmark
+        - suggested parameter adjustments (if underperforming)
+      Accumulated backtest results inform future optimize mode defaults.
