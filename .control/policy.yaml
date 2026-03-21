@@ -20,6 +20,9 @@ categories:
   - id: agent_improvement
     name: Agent Self-Improvement
     setpoints: [S14, S15]
+  - id: egri_optimization
+    name: EGRI Optimization Loop Governance
+    setpoints: [S16, S17, S18]
 
 setpoints:
   # ── Trading Safety ──────────────────────────────────────────────
@@ -221,3 +224,52 @@ setpoints:
         - comparison to benchmark
         - suggested parameter adjustments (if underperforming)
       Accumulated backtest results inform future optimize mode defaults.
+
+  # ── EGRI Optimization Loop Governance ──────────────────────────────
+  - id: S16
+    category: egri_optimization
+    description: "EGRI loops over historical data run autonomously (sandbox mode); loops proposing live trades require HumanGate"
+    target: 1.0
+    measurement: "egri_loops_with_correct_autonomy / total_egri_loops"
+    severity: blocking
+    enforcement: |
+      Before launching any EGRI loop:
+        1. Check if the problem-spec involves live trade execution.
+        2. If execution involves trade.py with live=true:
+           - OVERRIDE autonomy mode to "suggestion" or set selector to HumanGate.
+           - Log the override and reason.
+        3. If execution involves only backtest.py, scenario_analysis.py, or evaluators:
+           - Sandbox mode is permitted; auto-promote is acceptable.
+        4. All EGRI loops must log to the ledger path specified in the problem-spec.
+      This gate is absolute: no EGRI loop may auto-promote live trade decisions.
+
+  - id: S17
+    category: egri_optimization
+    description: "EGRI budget constraints are hard limits — fail closed, never 'one more trial'"
+    target: 1.0
+    measurement: "egri_loops_respecting_budget / total_egri_loops"
+    severity: blocking
+    enforcement: |
+      Every EGRI loop must respect:
+        - max_trials: never exceed this count
+        - total_time_s: halt if elapsed time exceeds cap
+        - time_per_trial_s: timeout and discard if single trial exceeds limit
+      When budget is exhausted:
+        1. STOP immediately — do not run "one more trial"
+        2. Return the best promoted artifact from the ledger
+        3. Report budget exhaustion to the user with trial count and best score
+      Budget cannot be extended without explicit user confirmation.
+
+  - id: S18
+    category: egri_optimization
+    description: "EGRI evaluator must be immutable during the loop — never mutate evaluator and artifact simultaneously"
+    target: 1.0
+    measurement: "egri_loops_with_immutable_evaluator / total_egri_loops"
+    severity: blocking
+    enforcement: |
+      EGRI Law 3: The evaluator (backtest.py, scenario_analysis.py, eval_backtest.py)
+      must NEVER be modified during an active EGRI loop.
+      The only mutable component is the artifact (strategy.yaml, contribution_plan.yaml, etc.).
+      Constraint checkers may be added but never removed during a loop.
+      If the evaluator needs improvement, stop the current loop, update the evaluator,
+      establish a new baseline, then start a fresh loop.

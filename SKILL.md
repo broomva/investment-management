@@ -400,11 +400,71 @@ investment-management
     └── rebalance-rules.json    # Rebalancing parameters
 ```
 
+## Compound: Autoany Integration (EGRI)
+
+This skill is EGRI-aware. When a user's request implies iterative optimization
+or strategy search, the agent should scaffold a problem-spec from the templates
+below and delegate to `/autoany` for autonomous improvement.
+
+### Optimization Triggers
+
+Invoke `/autoany` when the user asks to:
+- **"Optimize"** — allocation, weights, strategy parameters
+- **"Find the best"** — strategy, allocation, screening criteria
+- **"Compare strategies"** — systematic comparison across N variants
+- **"Backtest variations"** — test parameter sweeps
+- **"What if I changed"** — sensitivity analysis via mutations
+- **"Stress test"** — combined with optimization intent
+
+### EGRI Problem-Spec Templates
+
+| Template | Artifact | Evaluator | Score | Use When |
+|----------|----------|-----------|-------|----------|
+| `strategy-optimization` | `strategy.yaml` (weights, rules) | `backtest.py --egri` | Sharpe ratio | Optimizing portfolio allocation |
+| `screen-evolution` | `screen_criteria.yaml` (thresholds) | `screener.py` + `eval_screen.py` | Forward return | Evolving stock selection criteria |
+
+Templates are at `templates/egri/`. The strategy artifact schema is at
+`templates/egri/strategy-artifact.yaml`.
+
+### Delegation Flow
+
+```
+1. User request → agent detects optimization intent
+2. Load personal context from finance-substrate (patrimonio, salary, TRM)
+3. Pull historical market data (market_data.py)
+4. Scaffold problem-spec from template, fill in:
+   - Starting allocation as baseline artifact
+   - Period, constraints from policy.yaml
+   - Goal metrics from user's request
+5. Invoke /autoany with scaffolded problem-spec
+6. EGRI loop runs: Proposer → Executor (backtest.py) → Evaluator → Selector
+7. Return promoted strategy + ledger summary to user
+8. Log results for cross-session strategy inheritance (autoany-lago)
+```
+
+### EGRI Evaluator Bridge
+
+`scripts/eval_backtest.py` wraps `backtest.py` for use as an EGRI evaluator:
+- Takes a strategy YAML artifact + period
+- Returns structured `Outcome` (score, constraints_passed, violations)
+- Applies constraint expressions from the problem-spec
+- Can be used standalone: `python3 eval_backtest.py --strategy-file strategy.yaml --period 10y`
+
+### Safety Constraints (enforced in EGRI loops)
+
+- EGRI loops over **historical data are autonomous** (sandbox mode)
+- EGRI loops that **propose live trades require human gate** (HumanGate selector)
+- Max drawdown constraint: `-15%` (from policy S6)
+- Position concentration: `<= 25%` (from policy S2)
+- Budget: 50 trials max, 1 hour total
+- All trials logged to ledger for audit and cross-run inheritance
+
 ## Dependencies
 
 - Python 3.10+
 - `finance-substrate` skill (accounting, tax, certificates)
 - `wealth-management` skill (projections, goals, portfolio summary)
+- `autoany` (optional, for EGRI optimization loops)
 - Market data: `yfinance`, `fredapi`, `pycoingecko` (free)
 - Optimization: `pypfopt`, `riskfolio-lib`, `cvxpy` (optional, for advanced modes)
 - Trading: `alpaca-trade-api`, `coinbase-advanced-py` (optional, for execution)
@@ -428,7 +488,8 @@ investment-management/
 │   ├── tracker.py                    # Mode 8: position tracking
 │   ├── rebalancer.py                 # Mode 9: intelligent rebalancing
 │   ├── market_data.py                # Mode 10: data retrieval
-│   └── scorer.py                     # Mode 11: investment scoring
+│   ├── scorer.py                     # Mode 11: investment scoring
+│   └── eval_backtest.py              # EGRI evaluator wrapper (autoany bridge)
 ├── references/
 │   ├── investment-philosophies.md    # Legendary investor frameworks
 │   ├── platform-apis.md             # API reference for all platforms
@@ -437,7 +498,11 @@ investment-management/
 │   └── alternative-investments.md   # Crypto, prediction markets, RE, VC
 ├── templates/
 │   ├── strategies.json               # Pre-built strategy configurations
-│   └── scoring-weights.json          # Philosophy scoring weights
+│   ├── scoring-weights.json          # Philosophy scoring weights
+│   └── egri/                         # EGRI problem-spec templates (autoany)
+│       ├── strategy-optimization.yaml   # Portfolio strategy optimization
+│       ├── screen-evolution.yaml        # Screening criteria evolution
+│       └── strategy-artifact.yaml       # Strategy YAML schema (mutable artifact)
 ├── .control/
 │   └── policy.yaml                   # Trading limits, risk gates
 └── README.md
