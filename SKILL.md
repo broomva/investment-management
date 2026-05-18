@@ -1,21 +1,6 @@
 ---
 name: investment-management
-description: >
-  Comprehensive investment management skill for portfolio construction, analysis,
-  and execution. Compounds on finance-substrate (accounting/tax) and
-  wealth-management (projections/goals) to form a complete financial management
-  framework. Covers traditional investing (stocks, ETFs, bonds, futures),
-  alternative investments (crypto, prediction markets, real estate, VC),
-  quantitative analytics (factor models, Monte Carlo, optimization), and
-  platform integration (Alpaca, Coinbase, Polymarket, agent-browser for
-  Colombian platforms). Embodies investment philosophies from Buffett, Dalio,
-  Bogle, Munger, and Marks. Use when: (1) building or analyzing a portfolio,
-  (2) screening stocks/ETFs/crypto, (3) running backtests or factor analysis,
-  (4) executing trades or rebalancing, (5) tracking investments across platforms,
-  (6) researching market data or fundamentals, (7) making investment decisions
-  with structured frameworks. Triggers on: 'investment', 'portfolio', 'stocks',
-  'ETF', 'bonds', 'crypto', 'trading', 'backtest', 'factor model', 'rebalance',
-  'screen stocks', 'market data', 'Polymarket', 'Alpaca', 'asset allocation'.
+description: "Investment management skill — portfolio construction, analysis, and execution. Compounds finance-substrate (accounting/tax) + wealth-management (projections/goals) into a full financial framework. Covers traditional investing (stocks, ETFs, bonds), alternatives (crypto, prediction markets, real estate, VC), quantitative analytics (factor models, Monte Carlo, optimization), and platform integration (Alpaca, Coinbase, Polymarket, agent-browser for Colombian platforms). Embodies philosophies from Buffett, Dalio, Bogle, Munger, and Marks. Use when: (1) building or analyzing a portfolio, (2) screening stocks/ETFs/crypto, (3) running backtests or factor analysis, (4) executing trades or rebalancing, (5) tracking investments across platforms, (6) researching market data or fundamentals, (7) making investment decisions with structured frameworks. Triggers on 'investment', 'portfolio', 'stocks', 'ETF', 'bonds', 'crypto', 'trading', 'backtest', 'factor model', 'rebalance', 'Polymarket', 'Alpaca', 'asset allocation'."
 ---
 
 # Investment Management
