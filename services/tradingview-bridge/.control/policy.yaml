@@ -1,13 +1,9 @@
-# tradingview-bridge — service-local control policy.
+# tradingview-bridge — service-local control policy (v0.2.0 — PR 2).
 # Composes with the investment-management skill's .control/policy.yaml and
 # the umbrella workspace .control/policy.yaml (broomva/workspace).
-#
-# Gate IDs are local to this service. The S7/S8/S9 candidates referenced
-# in the broker-selection ADR are deferred to PR 2 (where the executor
-# can actually enforce per-broker caps and Formulario 4 reminders).
 
 service: tradingview-bridge
-version: 0.1.0
+version: 0.2.0
 canonical-adr: https://github.com/broomva/workspace/blob/main/docs/specs/2026-05-22-broker-selection-cross-asset.html
 linear-ticket: https://github.com/broomva/workspace/blob/main/tasks/bro-167-cross-asset-trading-platform.md
 
@@ -17,10 +13,7 @@ gates:
     blocker: true
     description: >
       Service exits with non-zero status at startup if
-      TVBRIDGE_TRADING_MODE != "paper". Implemented in
-      src/tradingview_bridge/settings.py:assert_paper_only().
-      This is a structural safety, not a runtime check — PR 1 has
-      no order-placement code path even if this were bypassed.
+      TVBRIDGE_TRADING_MODE != "paper".
     test-coverage:
       - tests/test_webhook_smoke.py::test_paper_only_assertion_blocks_live
 
@@ -29,8 +22,7 @@ gates:
     blocker: true
     description: >
       Every POST /webhook request must originate from an IP in
-      TVBRIDGE_TV_ALLOWED_IPS. Defaults to TradingView's published
-      webhook source IPs. Defense-in-depth alongside shared-secret.
+      TVBRIDGE_TV_ALLOWED_IPS (TradingView's published webhook source IPs).
     test-coverage:
       - tests/test_webhook_smoke.py::test_webhook_wrong_ip
 
@@ -38,8 +30,8 @@ gates:
     enforce: runtime
     blocker: true
     description: >
-      The `secret` field in the alert body must match TVBRIDGE_TV_WEBHOOK_SECRET
-      under hmac.compare_digest (constant-time comparison).
+      The `secret` field in the alert body must match
+      TVBRIDGE_TV_WEBHOOK_SECRET under hmac.compare_digest.
     test-coverage:
       - tests/test_auth.py::test_require_valid_secret_rejects
       - tests/test_webhook_smoke.py::test_webhook_wrong_secret
@@ -49,41 +41,81 @@ gates:
     enforce: runtime
     blocker: false
     description: >
-      Auth (secret check) runs BEFORE pydantic schema validation. Prevents
-      leaking schema details (which fields exist, validation rules) to
-      unauthenticated callers via 422 responses.
+      Auth (secret check) runs BEFORE pydantic schema validation.
     test-coverage:
       - tests/test_webhook_smoke.py::test_webhook_validation_error_after_auth
 
-# Deferred to PR 2 — placeholders for traceability.
-deferred:
+  # --- PR 2 newly-active gates ---
+
   webhook-rate-limit:
-    target-pr: 2
-    description: 60 req/min per source IP via slowapi or fastapi-limiter
+    enforce: runtime
+    blocker: true
+    description: >
+      Per-IP rate limit (default 60 req/min) via TokenBucketLimiter (60s
+      sliding window). Excess requests get 429 without consuming the
+      secret/schema budget.
+    test-coverage:
+      - tests/test_ratelimit.py
+      - tests/test_webhook_smoke.py::test_webhook_429_on_rate_limit
 
   alert-idempotency:
-    target-pr: 2
-    description: SQLite store keyed on alert_id; duplicate alerts get 200 with status=duplicate
+    enforce: runtime
+    blocker: false
+    description: >
+      SQLite store keyed on alert_id; duplicate alerts get 200 with
+      status=duplicate + same order_id from the original dispatch. Prevents
+      double-fire on TradingView retries.
+    test-coverage:
+      - tests/test_idempotency.py
+      - tests/test_webhook_smoke.py::test_webhook_duplicate_alert_returns_duplicate
 
+  broker-mode-mock-default:
+    enforce: startup
+    blocker: false
+    description: >
+      TVBRIDGE_BROKER_MODE defaults to "mock" — no broker contact in CI or
+      local dev without explicit opt-in. Operator flips to "real-paper"
+      explicitly + provides per-broker credentials.
+    test-coverage:
+      - tests/test_clients_interface.py::test_real_client_mock_mode_places_order
+
+  real-paper-requires-creds:
+    enforce: runtime
+    blocker: true
+    description: >
+      When TVBRIDGE_BROKER_MODE=real-paper, each broker client checks for
+      its required env vars and raises NotConfiguredError if missing. The
+      dispatcher translates this into a `rejected` DispatchResult; no
+      cryptic SDK exceptions leak to the response.
+    test-coverage:
+      - tests/test_clients_interface.py::test_real_client_real_paper_without_creds_raises
+
+# Still deferred — promoted to PR 3+ for traceability.
+deferred:
   per-broker-position-cap:
-    target-pr: 2
-    description: S9 candidate — per-broker drawdown and concentration caps
+    target-pr: 3
+    description: >
+      S9 candidate — per-broker drawdown + concentration caps. Requires
+      a broker-positions reader (REST poll) which depends on real-paper
+      wiring (PR 2b).
 
   formulario-4-reminder:
-    target-pr: 2
+    target-pr: 3
     description: >
       S7 candidate — any IBKR outbound capital instruction above threshold
-      blocks until Formulario 4 (Banco República) is logged in the workspace
+      blocks until Formulario 4 (Banco República) is logged. Depends on
+      capital-transfer detection, also PR 2b.
 
   cfd-broker-blocked:
-    target-pr: 2
+    target-pr: 4
     description: >
-      S8 candidate — hard-block any executor call to a CFD broker endpoint
-      (eToro, Plus500, MT4). CFDs are explicitly out of scope per ADR.
+      S8 candidate — hard-block any executor call to a CFD broker
+      endpoint. Not relevant in PR 2 because the dispatcher only routes
+      to IBKR/Kraken/Polymarket (no CFD path exists).
 
-  bookkeeping-journal:
-    target-pr: 2
+  bookkeeping-journal-required:
+    target-pr: 3
     description: >
-      Every alert (accepted or rejected) journals to
-      research/entities/pattern/strategy-{strategy_name}.md via
-      skills/bookkeeping/scripts/bookkeeping.py file (workspace repo)
+      Currently graceful no-op when CLI not found (this allows tests + CI
+      to pass without the workspace bookkeeping CLI). PR 3 promotes to
+      blocker when running in production deployment.

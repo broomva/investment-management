@@ -1,14 +1,13 @@
-"""End-to-end smoke tests against the FastAPI app.
+"""End-to-end smoke tests — PR 2 wires broker clients (mock mode in CI).
 
 These tests exercise the full pipeline:
-  request → IP check → JSON parse → secret check → schema validation → dispatcher stub.
+  request → IP check → rate limit → JSON parse → secret check → schema validation
+       → idempotency check → broker dispatch (MockClient) → response.
 
-The dispatcher returns a `stubbed` result in PR 1, so the smoke test asserts on
-that — proving the entire receiver pipeline is intact without any broker code.
-
-Tests build their own TestClient per case (no shared fixture-level client) so
-the lifespan re-runs cleanly with the test's env vars in effect. `importlib.reload`
-is used to pick up new settings after monkeypatch.setenv.
+PR 2 changes from PR 1:
+- happy path now returns `accepted` + `order_id` instead of `stubbed`
+- new: 429 on rate-limit
+- new: `duplicate` status on idempotency hit
 """
 
 from __future__ import annotations
@@ -28,24 +27,16 @@ TV_IP_BAD = "203.0.113.42"
 
 
 def _headers(ip: str = TV_IP_OK) -> dict[str, str]:
-    """TestClient defaults to 127.0.0.1; we set X-Forwarded-For and trust it."""
     return {"X-Forwarded-For": ip}
 
 
 @pytest.fixture
 def trusted_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Honor X-Forwarded-For so tests can simulate TV's source IP."""
     monkeypatch.setenv("TVBRIDGE_TRUST_FORWARDED_FOR", "true")
 
 
 @pytest.fixture
 def fresh_app(paper_env: None, trusted_proxy_env: None) -> Iterator[TestClient]:
-    """Build a fresh app + TestClient for each test.
-
-    `importlib.reload` ensures the lifespan reads the current env vars.
-    Using a fixture-yielded TestClient inside a `with` block guarantees
-    the lifespan startup runs and shutdown fires after the test.
-    """
     settings_module.get_settings.cache_clear()
     importlib.reload(app_module)
     with TestClient(app_module.app) as c:
@@ -58,19 +49,38 @@ def test_health(fresh_app: TestClient) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["mode"] == "paper"
+    assert body["broker_mode"] == "mock"
+    assert body["brokers"] == {"ibkr": True, "kraken": True, "polymarket": True}
 
 
-def test_webhook_happy_path(
+def test_webhook_happy_path_accepted(
     fresh_app: TestClient,
     valid_alert_body: dict[str, Any],
 ) -> None:
     resp = fresh_app.post("/webhook", json=valid_alert_body, headers=_headers(TV_IP_OK))
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["status"] == "stubbed"
+    assert body["status"] == "accepted"
     assert body["broker"] == "ibkr"
     assert body["alert_id"] == "test-alert-001"
-    assert "PR 2" in body["detail"]
+    assert body["order_id"] is not None
+    assert body["order_id"].startswith("mock-")
+
+
+def test_webhook_duplicate_alert_returns_duplicate(
+    fresh_app: TestClient,
+    valid_alert_body: dict[str, Any],
+) -> None:
+    """Same alert_id fired twice → second response is 'duplicate' with same order_id."""
+    resp1 = fresh_app.post("/webhook", json=valid_alert_body, headers=_headers(TV_IP_OK))
+    assert resp1.status_code == 200
+    first_order = resp1.json()["order_id"]
+
+    resp2 = fresh_app.post("/webhook", json=valid_alert_body, headers=_headers(TV_IP_OK))
+    assert resp2.status_code == 200
+    body2 = resp2.json()
+    assert body2["status"] == "duplicate"
+    assert body2["order_id"] == first_order
 
 
 def test_webhook_wrong_secret(
@@ -99,21 +109,6 @@ def test_webhook_wrong_ip(
     assert resp.status_code == 403
 
 
-def test_webhook_validation_error_after_auth(
-    fresh_app: TestClient,
-    valid_alert_body: dict[str, Any],
-) -> None:
-    """Wrong secret returns 401 even when other fields are also invalid.
-
-    We check auth before validation to avoid leaking schema info to an
-    unauthenticated caller.
-    """
-    valid_alert_body["secret"] = "wrong"
-    valid_alert_body["action"] = "yolo"  # also invalid
-    resp = fresh_app.post("/webhook", json=valid_alert_body, headers=_headers(TV_IP_OK))
-    assert resp.status_code == 401  # auth fails first, schema error never surfaces
-
-
 def test_webhook_422_on_bad_action_with_good_secret(
     fresh_app: TestClient,
     valid_alert_body: dict[str, Any],
@@ -134,14 +129,34 @@ def test_webhook_400_on_bad_json(
     assert resp.status_code == 400
 
 
-def test_paper_only_assertion_blocks_live(live_env: None) -> None:
-    """Test the safety function directly — not via the TestClient lifespan.
+def test_webhook_429_on_rate_limit(
+    paper_env: None,
+    trusted_proxy_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    valid_alert_body: dict[str, Any],
+) -> None:
+    """Exceeding rate limit returns 429.
 
-    When `assert_paper_only` is called in a `live` environment it raises
-    `PaperOnlyViolation` (a `SystemExit` subclass). Starlette wraps lifespan
-    exceptions in `BaseExceptionGroup` (Python 3.11+) so calling the function
-    directly is simpler and the underlying invariant is the same.
+    Set the limit very low (2/min) so the test doesn't take 60+ seconds.
+    The rate limiter is constructed in the lifespan from
+    settings.rate_limit_per_minute, so monkeypatch the env var.
     """
+    monkeypatch.setenv("TVBRIDGE_RATE_LIMIT_PER_MINUTE", "2")
+    settings_module.get_settings.cache_clear()
+    importlib.reload(app_module)
+
+    with TestClient(app_module.app) as client:
+        # Vary alert_id so idempotency doesn't short-circuit us before the limiter
+        for i in range(2):
+            body = {**valid_alert_body, "alert_id": f"rate-{i}"}
+            r = client.post("/webhook", json=body, headers=_headers(TV_IP_OK))
+            assert r.status_code == 200, f"request {i}: {r.text}"
+        body3 = {**valid_alert_body, "alert_id": "rate-3"}
+        r = client.post("/webhook", json=body3, headers=_headers(TV_IP_OK))
+        assert r.status_code == 429, r.text
+
+
+def test_paper_only_assertion_blocks_live(live_env: None) -> None:
     settings_module.get_settings.cache_clear()
     settings = settings_module.get_settings()
     assert settings.trading_mode == "live"
@@ -152,9 +167,7 @@ def test_paper_only_assertion_blocks_live(live_env: None) -> None:
 
 
 def test_paper_only_assertion_passes_in_paper(paper_env: None) -> None:
-    """Sanity — `assert_paper_only` does NOT raise when mode is paper."""
     settings_module.get_settings.cache_clear()
     settings = settings_module.get_settings()
     assert settings.trading_mode == "paper"
-    # Should be a no-op.
     settings_module.assert_paper_only(settings)

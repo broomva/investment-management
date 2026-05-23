@@ -70,6 +70,26 @@ class Settings(BaseSettings):
         ),
     )
 
+    broker_mode: Literal["mock", "real-paper"] = Field(
+        default="mock",
+        description=(
+            "Broker dispatch mode. 'mock' (default) routes every alert to a "
+            "MockClient that records orders in-memory — used by all tests and "
+            "local dev. 'real-paper' attempts to connect to IBKR TWS (paper "
+            "port), Kraken sandbox, and Polymarket CLOB; requires broker-"
+            "specific env vars per README."
+        ),
+    )
+
+    db_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to SQLite idempotency DB. Default: "
+            "~/.tradingview-bridge/idempotency.sqlite. Tests override via "
+            "a tmp_path fixture."
+        ),
+    )
+
     @field_validator("tv_allowed_ips", mode="before")
     @classmethod
     def _split_csv(cls, v: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:

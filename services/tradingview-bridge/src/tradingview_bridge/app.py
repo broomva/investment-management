@@ -1,70 +1,116 @@
-"""FastAPI app — POST /webhook (TradingView Pine Script alerts) + GET /health.
+"""FastAPI app — POST /webhook + GET /health.
 
-PR 1: webhook receiver only. No broker clients wired. Paper-only enforced
-at startup.
+PR 2 wires the multi-broker dispatcher, idempotency store, rate limiter,
+and bookkeeping journal hook into the request pipeline.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import ValidationError
 
-from .auth import require_valid_secret, verify_source_ip
+from .auth import require_valid_secret, source_ip, verify_source_ip
 from .dispatch import Dispatcher
+from .idempotency import IdempotencyStore, default_db_path
 from .logging_setup import configure_logging
+from .ratelimit import TokenBucketLimiter
 from .schemas import DispatchResult, TVAlert
 from .settings import assert_paper_only, get_settings
 
-dispatcher = Dispatcher()
+# Module-level singletons; populated in lifespan.
+_dispatcher: Dispatcher | None = None
+_limiter: TokenBucketLimiter | None = None
+_idempotency_store: IdempotencyStore | None = None
+
+
+def get_dispatcher() -> Dispatcher:
+    """FastAPI dependency for the Dispatcher singleton."""
+    if _dispatcher is None:
+        raise RuntimeError("Dispatcher not initialized — lifespan did not run.")
+    return _dispatcher
+
+
+def get_limiter() -> TokenBucketLimiter:
+    if _limiter is None:
+        raise RuntimeError("RateLimiter not initialized — lifespan did not run.")
+    return _limiter
+
+
+def check_rate_limit(
+    request: Request,
+    limiter: TokenBucketLimiter = Depends(get_limiter),
+) -> None:
+    """FastAPI dependency — 429 if the request exceeds per-IP rate."""
+    ip = source_ip(request)
+    if not limiter.check(ip):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded: {limiter.limit} requests/minute per IP.",
+        )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Startup + shutdown hook.
+    """Startup hook — runs paper-only assertion, wires singletons."""
+    global _dispatcher, _limiter, _idempotency_store
 
-    Wires logging, then runs the paper-only assertion BEFORE the server
-    accepts any traffic. If we're not in paper mode the assertion exits
-    the process with code 1.
-    """
     log = configure_logging()
     settings = get_settings()
     assert_paper_only(settings)
+
+    db_path = Path(settings.db_path).expanduser() if settings.db_path else default_db_path()
+    _idempotency_store = IdempotencyStore(db_path=db_path)
+    _limiter = TokenBucketLimiter(limit_per_minute=settings.rate_limit_per_minute)
+    _dispatcher = Dispatcher(
+        broker_mode=settings.broker_mode,
+        idempotency_store=_idempotency_store,
+    )
+
     log.info(
         "tradingview_bridge_started",
         mode=settings.trading_mode,
+        broker_mode=settings.broker_mode,
         allowed_ips=list(settings.tv_allowed_ips),
         rate_limit_per_minute=settings.rate_limit_per_minute,
         trust_forwarded_for=settings.trust_forwarded_for,
+        idempotency_db=str(db_path),
     )
     yield
     log.info("tradingview_bridge_stopped")
+
+    _dispatcher = None
+    _limiter = None
+    _idempotency_store = None
 
 
 app = FastAPI(
     title="TradingView Bridge",
     description=(
         "Webhook receiver for TradingView Pine Script alerts. "
-        "PR 1: receiver only, paper-only, no broker execution."
+        "PR 2: receiver + multi-broker executor (paper-only, mock-default)."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
 
 @app.get("/health")
-async def health() -> dict[str, Any]:
-    """Liveness probe. Does NOT report broker connectivity (no brokers wired)."""
+async def health(dispatcher: Dispatcher = Depends(get_dispatcher)) -> dict[str, Any]:
+    """Liveness probe with per-broker connectivity status."""
     s = get_settings()
+    broker_health = await dispatcher.health_check()
     return {
         "status": "ok",
         "mode": s.trading_mode,
-        "version": "0.1.0",
-        "pr_stage": "1 — receiver only, no execution",
+        "broker_mode": s.broker_mode,
+        "version": "0.2.0",
+        "brokers": broker_health,
     }
 
 
@@ -72,22 +118,15 @@ async def health() -> dict[str, Any]:
     "/webhook",
     response_model=DispatchResult,
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(verify_source_ip)],
+    dependencies=[Depends(verify_source_ip), Depends(check_rate_limit)],
 )
-async def webhook(request: Request) -> DispatchResult:
-    """Receive a Pine Script alert, validate, authenticate, dispatch.
-
-    - 403 if source IP not in TV allowlist (raised by verify_source_ip dep)
-    - 422 if payload doesn't validate as TVAlert
-    - 401 if shared secret doesn't match
-    - 200 with DispatchResult otherwise
-    """
+async def webhook(
+    request: Request,
+    dispatcher: Dispatcher = Depends(get_dispatcher),
+) -> DispatchResult:
+    """Receive a Pine Script alert; validate, authenticate, dispatch."""
     log = structlog.get_logger("tradingview_bridge.webhook")
 
-    # Parse body. ValidationError → 422 via FastAPI's automatic conversion when
-    # we use a Pydantic model as the param type — but we read the raw body and
-    # parse manually because we want to authenticate the secret BEFORE letting
-    # any other validation error leak details to an unauthenticated caller.
     try:
         body = await request.json()
     except Exception as e:
@@ -103,7 +142,6 @@ async def webhook(request: Request) -> DispatchResult:
             detail="Request body must be a JSON object",
         )
 
-    # Authenticate FIRST — pull just the secret, verify constant-time.
     provided_secret = body.get("secret")
     if not isinstance(provided_secret, str) or not provided_secret:
         log.warning("webhook_missing_secret")
@@ -113,7 +151,6 @@ async def webhook(request: Request) -> DispatchResult:
         )
     require_valid_secret(provided_secret)
 
-    # Now validate the full schema.
     try:
         alert = TVAlert(**body)
     except ValidationError as e:
@@ -123,6 +160,4 @@ async def webhook(request: Request) -> DispatchResult:
             detail=e.errors(),
         ) from e
 
-    # Dispatch (PR 1: stubbed for all brokers).
-    result = await dispatcher.dispatch(alert)
-    return result
+    return await dispatcher.dispatch(alert)
