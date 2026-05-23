@@ -1,34 +1,40 @@
-"""Dispatcher — routes a validated TVAlert to the right broker client.
+"""Dispatcher — routes a validated TVAlert through idempotency + broker client.
 
-PR 1: routing logic is complete; broker clients are stubs that raise
-NotImplementedError with a clear "PR 2" message. The handler in `app.py`
-catches NotImplementedError and returns a `stubbed` DispatchResult so a
-smoke test can exercise the full pipeline end-to-end without touching
-any broker API.
+PR 2 replaces PR 1's NotImplementedError stubs with real client-backed dispatch:
 
-PR 2 will replace the stubs with real client calls (paper-only) and remove
-the NotImplementedError catch in the handler.
+1. Route by asset_class to a broker name (pure function `route_asset_class`)
+2. Idempotency check — if alert_id was seen, return the existing receipt
+3. Call the broker client (mock or real-paper, depending on TVBRIDGE_BROKER_MODE)
+4. Record the new (alert_id, order_id) in the idempotency store
+5. Fire-and-forget bookkeeping journal entry
+6. Return DispatchResult
+
+Failure modes:
+- NotConfiguredError from the client (real-paper without creds) → rejected
+- Idempotency hit (alert already processed) → duplicate with existing order_id
+- Bookkeeping subprocess failure → logged, never propagated
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from datetime import datetime
 
+import aiosqlite
 import structlog
 
+from .bookkeeping import schedule_journal
+from .clients import IBKRClient, KrakenClient, PolymarketClient
+from .clients.base import BrokerClient, BrokerName, NotConfiguredError
+from .idempotency import IdempotencyRecord, IdempotencyStore
 from .schemas import AssetClass, DispatchResult, TVAlert
 
 log = structlog.get_logger("tradingview_bridge.dispatch")
-
-BrokerName = Literal["ibkr", "kraken", "polymarket"]
 
 
 def route_asset_class(asset_class: AssetClass) -> BrokerName:
     """Pure function — returns the broker name responsible for an asset class.
 
-    Extracted as a top-level function so tests can exercise routing without
-    instantiating the dispatcher and so future broker additions only touch
-    this function.
+    Extracted so future broker additions only touch this function.
     """
     if asset_class in ("stock", "etf", "bond", "fx"):
         return "ibkr"
@@ -36,22 +42,68 @@ def route_asset_class(asset_class: AssetClass) -> BrokerName:
         return "kraken"
     if asset_class == "prediction":
         return "polymarket"
-    # Pydantic Literal validation should prevent this branch, but defense
-    # in depth — explicit error beats AttributeError.
     raise ValueError(f"Unknown asset class: {asset_class!r}")
 
 
 class Dispatcher:
-    """Async dispatcher to broker clients.
+    """Async dispatcher backed by broker clients + optional idempotency store.
 
-    PR 1: every `_dispatch_*` method raises NotImplementedError. The webhook
-    handler catches this and returns a `stubbed` result, so the full pipeline
-    is testable without any broker integration.
+    Construct ONCE per process — owned by the FastAPI app lifespan in `app.py`.
+    Tests construct fresh Dispatcher instances per case via fixtures.
     """
 
+    def __init__(
+        self,
+        broker_mode: str = "mock",
+        idempotency_store: IdempotencyStore | None = None,
+        clients_override: dict[BrokerName, BrokerClient] | None = None,
+    ) -> None:
+        """
+        Args:
+            broker_mode: "mock" or "real-paper" — see clients/base.py.
+            idempotency_store: SQLite-backed dedup. None means no dedup
+                (acceptable for tests that don't assert idempotency).
+            clients_override: test hook — inject specific clients without
+                instantiating the real classes.
+        """
+        self._broker_mode = broker_mode
+        self._idempotency = idempotency_store
+
+        if clients_override is not None:
+            self._clients: dict[BrokerName, BrokerClient] = clients_override
+        else:
+            self._clients = {
+                "ibkr": IBKRClient(broker_mode),
+                "kraken": KrakenClient(broker_mode),
+                "polymarket": PolymarketClient(broker_mode),
+            }
+
     async def dispatch(self, alert: TVAlert) -> DispatchResult:
-        """Route the alert and return the (stubbed in PR 1) dispatch result."""
-        broker = route_asset_class(alert.asset_class)
+        """Route the alert through idempotency + broker + journal."""
+        broker_name = route_asset_class(alert.asset_class)
+        client = self._clients[broker_name]
+
+        # Idempotency pre-check
+        if self._idempotency is not None:
+            existing = await self._peek_idempotency(alert.alert_id)
+            if existing is not None:
+                log.info(
+                    "dispatch_duplicate",
+                    alert_id=alert.alert_id,
+                    existing_order_id=existing.order_id,
+                    existing_broker=existing.broker,
+                )
+                return DispatchResult(
+                    status="duplicate",
+                    broker=broker_name,
+                    alert_id=alert.alert_id,
+                    order_id=existing.order_id,
+                    detail=(
+                        f"Alert {alert.alert_id} already processed by "
+                        f"{existing.broker} (order {existing.order_id})."
+                    ),
+                )
+
         log.info(
             "alert_dispatched",
             alert_id=alert.alert_id,
@@ -60,40 +112,84 @@ class Dispatcher:
             symbol=alert.symbol,
             action=alert.action,
             size=str(alert.size),
-            size_type=alert.size_type,
-            broker=broker,
+            broker=broker_name,
+            mode=self._broker_mode,
         )
+
         try:
-            if broker == "ibkr":
-                return await self._dispatch_ibkr(alert)
-            if broker == "kraken":
-                return await self._dispatch_kraken(alert)
-            if broker == "polymarket":
-                return await self._dispatch_polymarket(alert)
-            raise AssertionError(f"unreachable: broker={broker}")
-        except NotImplementedError as e:
-            log.info("alert_stubbed", alert_id=alert.alert_id, broker=broker, detail=str(e))
-            return DispatchResult(
-                status="stubbed",
-                broker=broker,
-                detail=str(e),
+            receipt = await client.place_order(alert)
+        except NotConfiguredError as e:
+            log.warning(
+                "broker_not_configured",
                 alert_id=alert.alert_id,
+                broker=broker_name,
+                error=str(e),
+            )
+            return DispatchResult(
+                status="rejected",
+                broker=broker_name,
+                alert_id=alert.alert_id,
+                detail=str(e),
+            )
+        except NotImplementedError as e:
+            log.info(
+                "broker_not_implemented",
+                alert_id=alert.alert_id,
+                broker=broker_name,
+                detail=str(e),
+            )
+            return DispatchResult(
+                status="rejected",
+                broker=broker_name,
+                alert_id=alert.alert_id,
+                detail=f"Broker {broker_name} real-paper wiring deferred: {e}",
             )
 
-    async def _dispatch_ibkr(self, alert: TVAlert) -> DispatchResult:
-        raise NotImplementedError(
-            "PR 2 — IBKR client (ib_async) not wired yet. "
-            f"Would route asset_class={alert.asset_class} symbol={alert.symbol}."
+        # Record in idempotency store (after successful broker call)
+        if self._idempotency is not None:
+            await self._idempotency.check_or_insert(
+                alert_id=alert.alert_id,
+                broker=broker_name,
+                order_id=receipt.order_id,
+            )
+
+        # Fire-and-forget bookkeeping
+        schedule_journal(alert, receipt)
+
+        return DispatchResult(
+            status="accepted",
+            broker=broker_name,
+            alert_id=alert.alert_id,
+            order_id=receipt.order_id,
+            detail=f"Order placed by {broker_name} (paper={receipt.paper}).",
         )
 
-    async def _dispatch_kraken(self, alert: TVAlert) -> DispatchResult:
-        raise NotImplementedError(
-            "PR 2 — Kraken client (ccxt) not wired yet. "
-            f"Would route asset_class={alert.asset_class} symbol={alert.symbol}."
-        )
+    async def health_check(self) -> dict[str, bool]:
+        """Per-broker connectivity check for /health endpoint."""
+        return {broker: await client.health_check() for broker, client in self._clients.items()}
 
-    async def _dispatch_polymarket(self, alert: TVAlert) -> DispatchResult:
-        raise NotImplementedError(
-            "PR 2 — Polymarket client (py-clob-client) not wired yet. "
-            f"Would route asset_class={alert.asset_class} symbol={alert.symbol}."
-        )
+    async def _peek_idempotency(self, alert_id: str) -> IdempotencyRecord | None:
+        """Read-only check — returns existing record or None.
+
+        We can't use check_or_insert here because we don't have the
+        order_id yet. Acceptable tiny race window for PR 2's single-instance
+        mode; PR 3+ would use Redis SETNX or a DB transaction.
+        """
+        store = self._idempotency
+        if store is None:
+            return None
+        async with aiosqlite.connect(store._db_path) as db:
+            await store._ensure_schema(db)
+            cursor = await db.execute(
+                "SELECT broker, order_id, created_at FROM alert_idempotency WHERE alert_id = ?",
+                (alert_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return IdempotencyRecord(
+                alert_id=alert_id,
+                broker=row[0],
+                order_id=row[1],
+                created_at=datetime.fromisoformat(row[2]),
+            )
