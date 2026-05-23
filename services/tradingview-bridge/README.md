@@ -1,108 +1,119 @@
 # tradingview-bridge
 
-Webhook receiver for TradingView Pine Script alerts. Dispatches to broker executors by `asset_class` (IBKR for stocks/bonds/FX, Kraken for crypto, Polymarket for prediction markets).
+Webhook receiver + multi-broker executor for TradingView Pine Script alerts. Dispatches by `asset_class` to IBKR (stocks/bonds/FX), Kraken (crypto), and Polymarket (prediction markets) — paper-only, mock-by-default for CI.
 
-**Status: PR 1 — webhook receiver only. No execution. Paper-only enforced at startup.**
+**Status: PR 2 (v0.2.0) — receiver + executor + idempotency + rate limit + bookkeeping. Paper-only enforced at startup. Real-paper broker SDKs are an optional extras group (`tradingview-bridge[brokers]`).**
 
-- Workspace ticket: [`broomva/workspace#tasks/bro-167`](https://github.com/broomva/workspace/blob/main/tasks/bro-167-cross-asset-trading-platform.md)
+- Workspace ticket: [`broomva/workspace tasks/bro-167`](https://github.com/broomva/workspace/blob/main/tasks/bro-167-cross-asset-trading-platform.md)
 - Canonical decision record (broker selection): [`broomva/workspace docs/specs/2026-05-22-broker-selection-cross-asset.html`](https://github.com/broomva/workspace/blob/main/docs/specs/2026-05-22-broker-selection-cross-asset.html)
 
-## Architecture (target — PR 1 ships the left half)
+## Architecture (PR 2 ships everything below + skeletons for real-paper)
 
 ```
 TradingView Pine Script alert
-        │
-        │ POST /webhook  (shared-secret in body, TV source IP)
+        │  POST /webhook  (shared-secret in body, TV source IP)
         ▼
   ┌──────────────────────────────┐
-  │  FastAPI app                 │   ← PR 1 ships this
-  │  ├ verify source IP          │
-  │  ├ parse + validate TVAlert  │
-  │  ├ constant-time secret cmp  │
-  │  ├ structured log            │
+  │  FastAPI app                 │
+  │  ├ verify source IP          │   (PR 1)
+  │  ├ rate limit (token bucket) │   (PR 2)
+  │  ├ parse + validate TVAlert  │   (PR 1)
+  │  ├ constant-time secret cmp  │   (PR 1)
   │  └ dispatcher.dispatch()     │
   └──────────────┬───────────────┘
-                 │
                  ▼
   ┌──────────────────────────────┐
-  │  Dispatcher (asset_class →   │   ← PR 1 ships routing + stubs
-  │  broker)                     │       PR 2 fills in clients
-  │  ├ stock/etf/bond/fx → IBKR  │
-  │  ├ crypto            → Kraken│
-  │  └ prediction        → Polymarket
-  └──────────────────────────────┘
-                 │
-                 ▼  (PR 2)
+  │  Dispatcher                  │
+  │  ├ asset_class → broker      │   (PR 1, pure function)
+  │  ├ idempotency check         │   (PR 2, SQLite)
+  │  ├ broker client.place_order │   (PR 2)
+  │  └ schedule_journal()        │   (PR 2, fire-and-forget)
+  └──────────────┬───────────────┘
+                 ▼
   ┌──────────────────────────────┐
-  │  Broker clients (paper)      │
-  │  ├ ib_async      (IBKR)      │
-  │  ├ ccxt          (Kraken)    │
-  │  └ py-clob-client(Polymarket)│
+  │  BrokerClient ABC            │   (PR 2)
+  │  ├ MockClient   (default)    │   ← what tests + CI use
+  │  ├ IBKRClient   (real-paper) │   ← skeleton; PR 2b wires ib_async
+  │  ├ KrakenClient (real-paper) │   ← skeleton; PR 2b wires ccxt sandbox
+  │  └ PolymarketClient          │   ← skeleton; PR 2b wires py-clob-client
   └──────────────────────────────┘
                  │
-                 ▼  (PR 2)
-        Bookkeeping P6 journal
-        finance-substrate ledger
+                 ▼  (PR 3, fire-and-forget)
+        Bookkeeping CLI subprocess
+        → research/entities/pattern/strategy-{name}.md
 ```
 
-## What's in PR 1
+## What's in PR 2
 
-- **`app.py`** — FastAPI app, single `POST /webhook` endpoint, `GET /health`
-- **`schemas.py`** — `TVAlert`, `DispatchResult` Pydantic models
-- **`auth.py`** — TradingView IP allowlist, constant-time shared-secret comparison
-- **`dispatch.py`** — `Dispatcher` class routing by `asset_class` to broker stubs (all raise `NotImplementedError` with "PR 2" message)
-- **`settings.py`** — pydantic-settings; `TVBRIDGE_TRADING_MODE` required; rejects `live` at startup
-- **`logging_setup.py`** — structlog JSON formatter
-- **`.control/policy.yaml`** — service-local gates (paper-only-mode startup gate; placeholders for PR 2 gates)
-- **`tests/`** — unit + smoke (httpx); covers schema validation, auth (good/wrong secret/wrong IP), dispatch routing, paper-mode startup assertion
-- **`pyproject.toml`** — uv-managed; runtime + dev deps pinned to current majors
+**Broker layer (`src/tradingview_bridge/clients/`):**
+- `base.py` — `BrokerClient` ABC + `OrderReceipt` + `NotConfiguredError`
+- `mock.py` — `MockClient` (in-memory, used by every test)
+- `ibkr.py`, `kraken.py`, `polymarket.py` — real-paper skeletons; in mock mode they delegate to `MockClient`. Real-paper mode raises `NotConfiguredError` until PR 2b wires the SDKs.
 
-## What's deliberately NOT in PR 1
+**Infrastructure:**
+- `idempotency.py` — `IdempotencyStore` (aiosqlite), keyed on `alert_id`. Duplicate alerts get `status="duplicate"` + same `order_id`.
+- `ratelimit.py` — `TokenBucketLimiter` (per-IP, 60-second sliding window). 429 on exceedance.
+- `bookkeeping.py` — `schedule_journal()` fires a subprocess to the workspace bookkeeping CLI. Graceful no-op when CLI not on PATH.
 
-- Any broker client (`ib_async`, `ccxt`, `py-clob-client`) — PR 2
-- Idempotency layer (SQLite by alert_id) — PR 2
-- Bookkeeping journal writes — PR 2
-- Per-broker position-cap gate — PR 2
-- Formulario 4 reminder gate — PR 2
-- Pine Script library — PR 3
-- Interceptor chart screencap — PR 3
+**Dispatcher updates (`dispatch.py`):**
+- Constructor: `Dispatcher(broker_mode, idempotency_store, clients_override)`
+- `dispatch(alert)` now: route → idempotency peek → client.place_order → store insert → journal → return `accepted`/`duplicate`/`rejected`.
+- Health check aggregates per-broker connectivity.
+
+**Tests (44+ cases across 7 files):**
+- `test_idempotency.py`, `test_ratelimit.py`, `test_clients_mock.py`, `test_clients_interface.py` — new
+- `test_dispatch.py`, `test_webhook_smoke.py` — updated to assert `accepted` / `duplicate` / 429
+- All run in `TVBRIDGE_BROKER_MODE=mock` — no broker creds needed in CI.
+
+**Schema changes (`schemas.py`):**
+- `DispatchResult.status` now `accepted | rejected | stubbed | duplicate`
+- `DispatchResult.order_id: str | None` — broker order id (None for stubbed/rejected)
+
+**Policy (`.control/policy.yaml`):**
+- 6 deferred PR 1 gates promoted to active: `webhook-rate-limit`, `alert-idempotency`, `broker-mode-mock-default`, `real-paper-requires-creds`, etc.
+- 4 new gates deferred to PR 3+ — per-broker position cap, Formulario 4 reminder, CFD broker block, journal-required.
+
+## What's deliberately NOT in PR 2 (deferred to PR 2b or later)
+
+- Real `ib_async` / `ccxt` / `py-clob-client` wiring (skeletons exist; PR 2b after broker onboarding)
+- Per-broker position cap reader (needs real broker positions API — PR 3)
+- Formulario 4 reminder gate (needs capital-transfer detection — PR 3)
+- Pine Script alpha library + Interceptor chart screencap (PR 3)
+- Trading-bot cookbook entry + Evals trading domain (PR 4)
 
 ## Local dev
 
 ```bash
 cd services/tradingview-bridge
+
 uv sync --extra dev
+# To experiment with real-paper SDKs (not tested in CI):
+# uv sync --extra dev --extra brokers
+
 cp .env.example .env  # then edit TVBRIDGE_TV_WEBHOOK_SECRET
 
-# run tests
 uv run pytest -v
+uv run ruff check . && uv run ruff format --check . && uv run mypy src
 
-# run the service
-TVBRIDGE_TRADING_MODE=paper uv run uvicorn tradingview_bridge.app:app --reload --port 8787
+# Run the service in mock mode (default)
+TVBRIDGE_TRADING_MODE=paper TVBRIDGE_TV_WEBHOOK_SECRET=$(cat .env | grep SECRET= | cut -d= -f2) \
+  uv run uvicorn tradingview_bridge.app:app --reload --port 8787
 
-# smoke test (in another terminal)
+# Smoke test (in another terminal)
 curl -X POST http://127.0.0.1:8787/webhook \
   -H 'Content-Type: application/json' \
   -H 'X-Forwarded-For: 52.89.214.238' \
-  -d '{
-    "alert_id": "test-001",
-    "secret": "<your secret>",
-    "strategy_name": "smoke-test",
-    "asset_class": "stock",
-    "symbol": "AAPL",
-    "action": "buy",
-    "size": "10",
-    "size_type": "units",
-    "time": "2026-05-22T15:00:00Z"
-  }'
+  -d '{"alert_id":"test-001","secret":"<your secret>","strategy_name":"smoke","asset_class":"stock","symbol":"AAPL","action":"buy","size":"10","size_type":"units","time":"2026-05-23T15:00:00Z"}'
 ```
 
-Expected `200 OK` with body `{"status":"stubbed","broker":"ibkr","detail":"PR 2 — IBKR client (ib_async) not wired yet. ..."}`.
+Expected `200 OK` with body like `{"status":"accepted","broker":"ibkr","alert_id":"test-001","order_id":"mock-<uuid12>","detail":"Order placed by ibkr (paper=True)."}`.
 
-## TradingView Pine Script alert template (for PR 3, included here for reference)
+Re-fire the same alert_id → `{"status":"duplicate","broker":"ibkr","alert_id":"test-001","order_id":"<same mock id>",...}`.
+
+## TradingView Pine Script alert template
 
 ```pinescript
-// In Pine Script v5 alert message:
+// In Pine Script v5 alert message body:
 {
   "alert_id": "{{strategy.order.id}}",
   "secret": "REPLACE_WITH_YOUR_TVBRIDGE_TV_WEBHOOK_SECRET",
@@ -117,19 +128,41 @@ Expected `200 OK` with body `{"status":"stubbed","broker":"ibkr","detail":"PR 2 
 }
 ```
 
-Configure the webhook URL in the alert dialog: `https://your-host/webhook`. TradingView requires HTTPS — use Cloudflare Tunnel, ngrok, or similar for local dev.
+Webhook URL in the alert dialog: `https://your-host/webhook`. HTTPS required by TradingView; use Cloudflare Tunnel or ngrok for local dev.
+
+## Switching to real-paper mode (PR 2b)
+
+```bash
+# 1. Install broker SDKs
+uv sync --extra dev --extra brokers
+
+# 2. Set broker credentials (see .env.example)
+export TVBRIDGE_BROKER_MODE=real-paper
+export TVBRIDGE_IBKR_HOST=127.0.0.1
+export TVBRIDGE_IBKR_PORT=7497         # TWS paper port
+# (and similarly TVBRIDGE_KRAKEN_*, TVBRIDGE_POLYMARKET_*)
+
+# 3. Start TWS in paper mode (manual step — TWS doesn't headless)
+
+# 4. Re-run the service
+uv run uvicorn tradingview_bridge.app:app --port 8787
+```
+
+PR 2 ships the skeletons that raise `NotConfiguredError` when env vars are missing. PR 2b replaces the skeleton bodies with real SDK calls.
 
 ## Safety
 
-- **PAPER_ONLY** enforced at startup: `TVBRIDGE_TRADING_MODE` must be `paper`. Any other value → process exits 1 immediately. This is structural, not a runtime check.
-- **No broker clients in PR 1**: there is literally no code path that places an order. Even if PAPER_ONLY were bypassed, no order would ship.
-- **Shared-secret comparison**: `hmac.compare_digest` (constant-time) — prevents timing attacks.
-- **IP allowlist**: TradingView's published webhook source IPs are pinned in config; override via `TVBRIDGE_TV_ALLOWED_IPS`. Defense-in-depth alongside the secret.
-- **Rate limit**: PR 2 will wire 60 req/min default.
+- **PAPER_ONLY** enforced at startup — `TVBRIDGE_TRADING_MODE` must be `paper`; otherwise the lifespan hook exits 1.
+- **Mock-default broker mode** — no broker contact unless operator explicitly sets `TVBRIDGE_BROKER_MODE=real-paper` AND provides credentials.
+- **Idempotency** prevents double-fire on Pine Script retries (same `alert_id` → same `order_id`).
+- **Rate limiting** prevents runaway strategies (default 60 req/min per source IP).
+- **Constant-time secret comparison** — `hmac.compare_digest` against `TVBRIDGE_TV_WEBHOOK_SECRET`.
+- **TradingView IP allowlist** — defense-in-depth alongside the shared secret.
+- **Bookkeeping journal** — every accepted alert lands in `research/entities/pattern/strategy-{name}.md` via the workspace bookkeeping CLI (graceful no-op if CLI not reachable).
 
 ## See also
 
 - `SKILL.md` (this repo) — parent skill
-- [`broomva/finance-substrate`](https://github.com/broomva/finance-substrate) — tax substrate layer
+- [`broomva/finance-substrate`](https://github.com/broomva/finance-substrate) — tax substrate (Form 210, DIAN, TRM)
 - [Broker selection ADR](https://github.com/broomva/workspace/blob/main/docs/specs/2026-05-22-broker-selection-cross-asset.html)
 - [Linear ticket BRO-167](https://github.com/broomva/workspace/blob/main/tasks/bro-167-cross-asset-trading-platform.md)
