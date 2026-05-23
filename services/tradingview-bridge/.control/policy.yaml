@@ -1,0 +1,89 @@
+# tradingview-bridge — service-local control policy.
+# Composes with the investment-management skill's .control/policy.yaml and
+# the umbrella workspace .control/policy.yaml (broomva/workspace).
+#
+# Gate IDs are local to this service. The S7/S8/S9 candidates referenced
+# in the broker-selection ADR are deferred to PR 2 (where the executor
+# can actually enforce per-broker caps and Formulario 4 reminders).
+
+service: tradingview-bridge
+version: 0.1.0
+canonical-adr: https://github.com/broomva/workspace/blob/main/docs/specs/2026-05-22-broker-selection-cross-asset.html
+linear-ticket: https://github.com/broomva/workspace/blob/main/tasks/bro-167-cross-asset-trading-platform.md
+
+gates:
+  paper-only-mode:
+    enforce: startup
+    blocker: true
+    description: >
+      Service exits with non-zero status at startup if
+      TVBRIDGE_TRADING_MODE != "paper". Implemented in
+      src/tradingview_bridge/settings.py:assert_paper_only().
+      This is a structural safety, not a runtime check — PR 1 has
+      no order-placement code path even if this were bypassed.
+    test-coverage:
+      - tests/test_webhook_smoke.py::test_paper_only_assertion_blocks_live
+
+  source-ip-allowlist:
+    enforce: runtime
+    blocker: true
+    description: >
+      Every POST /webhook request must originate from an IP in
+      TVBRIDGE_TV_ALLOWED_IPS. Defaults to TradingView's published
+      webhook source IPs. Defense-in-depth alongside shared-secret.
+    test-coverage:
+      - tests/test_webhook_smoke.py::test_webhook_wrong_ip
+
+  shared-secret-constant-time:
+    enforce: runtime
+    blocker: true
+    description: >
+      The `secret` field in the alert body must match TVBRIDGE_TV_WEBHOOK_SECRET
+      under hmac.compare_digest (constant-time comparison).
+    test-coverage:
+      - tests/test_auth.py::test_require_valid_secret_rejects
+      - tests/test_webhook_smoke.py::test_webhook_wrong_secret
+      - tests/test_webhook_smoke.py::test_webhook_missing_secret
+
+  auth-before-schema-validation:
+    enforce: runtime
+    blocker: false
+    description: >
+      Auth (secret check) runs BEFORE pydantic schema validation. Prevents
+      leaking schema details (which fields exist, validation rules) to
+      unauthenticated callers via 422 responses.
+    test-coverage:
+      - tests/test_webhook_smoke.py::test_webhook_validation_error_after_auth
+
+# Deferred to PR 2 — placeholders for traceability.
+deferred:
+  webhook-rate-limit:
+    target-pr: 2
+    description: 60 req/min per source IP via slowapi or fastapi-limiter
+
+  alert-idempotency:
+    target-pr: 2
+    description: SQLite store keyed on alert_id; duplicate alerts get 200 with status=duplicate
+
+  per-broker-position-cap:
+    target-pr: 2
+    description: S9 candidate — per-broker drawdown and concentration caps
+
+  formulario-4-reminder:
+    target-pr: 2
+    description: >
+      S7 candidate — any IBKR outbound capital instruction above threshold
+      blocks until Formulario 4 (Banco República) is logged in the workspace
+
+  cfd-broker-blocked:
+    target-pr: 2
+    description: >
+      S8 candidate — hard-block any executor call to a CFD broker endpoint
+      (eToro, Plus500, MT4). CFDs are explicitly out of scope per ADR.
+
+  bookkeeping-journal:
+    target-pr: 2
+    description: >
+      Every alert (accepted or rejected) journals to
+      research/entities/pattern/strategy-{strategy_name}.md via
+      skills/bookkeeping/scripts/bookkeeping.py file (workspace repo)
