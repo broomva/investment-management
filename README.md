@@ -1,55 +1,25 @@
-# investment-management
+# investment-management (DEPRECATED — migrated to broomva/skills monorepo)
 
-Full-stack investment management skill: from philosophy to execution. Research, analyze, decide, execute, track, and optimize across traditional and alternative asset classes.
+> **Status:** This repository is in a 6-month deprecation window (until 2026-11-25). The skill has migrated to the [broomva/skills](https://github.com/broomva/skills) monorepo as a Tier-2 vendored skill.
 
-Compounds on [finance-substrate](https://github.com/broomva/finance-substrate) (accounting/tax) and [wealth-management](https://github.com/broomva/wealth-management) (projections/goals) for a complete financial management framework.
-
-## Quick Start
+## New install command
 
 ```bash
-# Install
-npx skills add broomva/investment-management -y -g
-
-# Market data (always works, no dependencies)
-python3 scripts/market_data.py --trm
-
-# With yfinance installed: pip install yfinance
-python3 scripts/market_data.py --ticker AAPL --type price --period 1y
-python3 scripts/screener.py --philosophy value --universe custom --tickers AAPL,MSFT,JPM,BAC,KO
-python3 scripts/scorer.py --ticker AAPL --philosophy balanced
+npx skills add broomva/skills --skill investment-management
 ```
 
-## Modes
+## Skill home (new)
 
-| # | Mode | Script | Type | Status |
-|---|------|--------|------|--------|
-| 1 | `screen` | `screener.py` | Screening | Working |
-| 2 | `research` | `research.py` | Analysis | Planned |
-| 3 | `factor` | `factor_analysis.py` | Quant | Planned |
-| 4 | `backtest` | `backtest.py` | Quant | Planned |
-| 5 | `optimize` | `portfolio_optimizer.py` | Quant | Planned |
-| 6 | `risk` | `risk_analysis.py` | Analysis | Planned |
-| 7 | `trade` | `trade.py` | Execution | Planned |
-| 8 | `track` | `tracker.py` | Tracking | Planned |
-| 9 | `rebalance` | `rebalancer.py` | Execution | Planned |
-| 10 | `data` | `market_data.py` | Data | Working |
-| 11 | `score` | `scorer.py` | Analysis | Working |
+[broomva/skills/skills/investment-management](https://github.com/broomva/skills/tree/main/skills/investment-management)
 
-## Investment Philosophies
+## Why migrated?
 
-Built-in scoring and screening frameworks from legendary investors:
+Per the [Broomva skills packaging strategy](https://github.com/broomva/workspace/blob/main/docs/specs/2026-05-25-skills-packaging-strategy.html), Tier-2 skills consolidate into the `broomva/skills` monorepo. This reduces repo sprawl, aligns with the 2026 ecosystem norm (`anthropics/skills`, `vercel-labs/skills`), and enables atomic cross-skill refactors.
 
-- **Value** (Graham/Buffett): Margin of safety, moats, owner earnings
-- **Quality** (Munger): ROIC, margin stability, debt discipline
-- **Growth** (Lynch): PEG ratio, tenbaggers, revenue acceleration
-- **Systematic** (Dalio/AQR): Factor exposure, risk parity, All-Weather
-- **Passive** (Bogle): Three-fund portfolio, low-cost indexing
-- **Barbell** (Taleb): 85% ultra-safe + 15% high-convexity
+## After 2026-11-25
 
-## Dependencies
+This repository will be archived (read-only on GitHub permanently). All updates ship from `broomva/skills`.
 
-- Python 3.10+ (core scripts work with stdlib only)
-- `yfinance` — Stock data (optional, `pip install yfinance`)
-- `pycoingecko` — Crypto data (optional, `pip install pycoingecko`)
-- `fredapi` — Macro data (optional, `pip install fredapi`)
-- No paid services required. All data stays local.
+## License
+
+[MIT](LICENSE) — unchanged.
